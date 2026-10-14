@@ -16,6 +16,21 @@ os.environ["PYTHONIOENCODING"] = "utf-8"
 import truststore
 truststore.inject_into_ssl()
 
+# AVG intercepts HTTPS with its own root cert, which isn't always in the Windows store
+# truststore reads. Trust it explicitly in every default SSL context (used by httpx).
+import ssl
+AVG_CERT = r"C:\ProgramData\AVG\Antivirus\wscert.pem"
+if os.path.exists(AVG_CERT):
+    _create_default_context = ssl.create_default_context
+    def _create_context_with_avg(*args, **kwargs):
+        ctx = _create_default_context(*args, **kwargs)
+        try:
+            ctx.load_verify_locations(AVG_CERT)
+        except Exception:
+            pass
+        return ctx
+    ssl.create_default_context = _create_context_with_avg
+
 import html
 import json
 import time
@@ -27,6 +42,7 @@ from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 
+import httpx
 import psutil
 from PIL import ImageGrab
 from dotenv import load_dotenv
@@ -58,8 +74,6 @@ load_dotenv(ENV_PATH)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_USERNAME = os.getenv("ALLOWED_USERNAME", "noahlimjj").lower().lstrip("@")
-AGY_PATH = os.getenv("AGY_PATH", r"C:\Users\noahl\AppData\Local\agy\bin\agy.exe")
-AGENTAPI_PATH = os.getenv("AGENTAPI_PATH", r"C:\Users\noahl\.gemini\antigravity-ide\bin\agentapi.bat")
 CONVERSATION_ID = os.getenv("CONVERSATION_ID", "latest")
 
 if not BOT_TOKEN:
@@ -71,26 +85,173 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("AntigravityTelegramBot")
+# httpx logs every request URL at INFO, and Telegram URLs contain the bot token
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# The IDE conversation the user last typed into, refreshed from the IDE by transcript_monitor
+_latest_user_conv: str | None = None
 
 def get_active_conversation_id(chat_id: int | None = None) -> str:
-    """Resolve active Antigravity IDE conversation ID."""
+    """Resolve active Antigravity IDE conversation ID.
+
+    Order: the chat's pick from /conv ("auto" = always follow the latest), then
+    CONVERSATION_ID in .env, then the IDE chat the user last typed into.
+    """
+    follow_latest = False
     if chat_id:
-        st = get_state(chat_id)
-        if st.get("conversation_id"):
-            return st["conversation_id"]
+        picked = get_state(chat_id).get("conversation_id")
+        if picked == "auto":
+            follow_latest = True
+        elif picked:
+            return picked
     env_conv = os.getenv("CONVERSATION_ID")
-    if env_conv and env_conv not in ("latest", "auto"):
+    if not follow_latest and env_conv and env_conv not in ("latest", "auto"):
         return env_conv
+    if _latest_user_conv:
+        return _latest_user_conv
+    # IDE not queried yet: fall back to the conversation with the most recent file activity.
+    # Directory mtimes don't change when files inside are written, so look at the files.
     try:
-        brain_dir = Path.home() / ".gemini" / "antigravity-ide" / "brain"
+        ide_dir = Path.home() / ".gemini" / "antigravity-ide"
+        activity: dict[str, float] = {}
+        conv_dir = ide_dir / "conversations"
+        if conv_dir.exists():
+            for f in conv_dir.glob("*.db*"):
+                cid = f.name.split(".")[0]
+                activity[cid] = max(activity.get(cid, 0), f.stat().st_mtime)
+        brain_dir = ide_dir / "brain"
         if brain_dir.exists():
-            dirs = [d for d in brain_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
-            if dirs:
-                latest = max(dirs, key=lambda d: d.stat().st_mtime)
-                return latest.name
+            for t in brain_dir.glob("*/.system_generated/logs/transcript.jsonl"):
+                cid = t.parents[2].name
+                activity[cid] = max(activity.get(cid, 0), t.stat().st_mtime)
+        if activity:
+            return max(activity, key=activity.get)
     except Exception as e:
         logger.warning(f"Failed to auto-detect latest conversation: {e}")
     return "latest"
+
+# Antigravity IDE connection
+# The bot talks to the IDE's own language server, the same one the IDE chat panel uses,
+# so everything runs on the IDE's existing sign-in (no separate CLI login). Its port and
+# CSRF token change on every IDE restart, so they're discovered from the running process.
+LS_EXE_NAME = "language_server_windows_x64.exe"
+LS_SERVICE = "exa.language_server_pb.LanguageServerService"
+_ls_env_cache: dict | None = None
+
+class IDEUnavailable(Exception):
+    pass
+
+def _ls_env_candidates() -> list[dict]:
+    """Possible language server connections, best guess first."""
+    cands = []
+    addr, csrf = os.environ.get("ANTIGRAVITY_LS_ADDRESS"), os.environ.get("ANTIGRAVITY_CSRF_TOKEN")
+    if addr and csrf:
+        cands.append({"address": addr, "csrf": csrf})
+    servers = []
+    for p in psutil.process_iter(["name", "cmdline"]):
+        try:
+            if (p.info["name"] or "").lower() != LS_EXE_NAME:
+                continue
+            args = p.info["cmdline"] or []
+            token = args[args.index("--csrf_token") + 1]
+            ports = sorted(c.laddr.port for c in p.net_connections(kind="tcp") if c.status == psutil.CONN_LISTEN)
+            servers.append(("--workspace_id" in args, token, ports))
+        except (psutil.Error, ValueError, IndexError):
+            continue
+    servers.sort(key=lambda s: s[0])  # IDE-wide server (no workspace) first
+    for _, token, ports in servers:
+        for port in ports:
+            cands.append({"address": f"127.0.0.1:{port}", "csrf": token})
+    return cands
+
+async def _post_ls(ls: dict, method: str, body: dict, timeout: float) -> dict:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(
+            f"http://{ls['address']}/{LS_SERVICE}/{method}",
+            json=body,
+            headers={"X-Codeium-Csrf-Token": ls["csrf"], "Connect-Protocol-Version": "1"},
+        )
+    if r.status_code != 200:
+        raise IDEUnavailable(f"{method} failed: HTTP {r.status_code} {r.text[:200]}")
+    return r.json()
+
+async def get_ls_env(refresh: bool = False) -> dict | None:
+    """Find (and cache) a reachable language server."""
+    global _ls_env_cache
+    if _ls_env_cache and not refresh:
+        return _ls_env_cache
+    _ls_env_cache = None
+    for cand in _ls_env_candidates():
+        try:
+            await _post_ls(cand, "GetUserStatus", {}, timeout=3)
+        except Exception:
+            continue
+        _ls_env_cache = cand
+        logger.info(f"Connected to Antigravity language server at {cand['address']}")
+        return cand
+    return None
+
+async def ide_rpc(method: str, body: dict | None = None, timeout: float = 30) -> dict:
+    """Call the IDE language server, rediscovering it once if the IDE restarted."""
+    last_err: Exception | None = None
+    for refresh in (False, True):
+        ls = await get_ls_env(refresh=refresh)
+        if not ls:
+            break
+        try:
+            return await _post_ls(ls, method, body or {}, timeout)
+        except Exception as e:
+            last_err = e
+    raise IDEUnavailable(f"Couldn't reach Antigravity IDE ({last_err or 'IDE not running'}). Is the IDE open?")
+
+async def ide_user_status() -> dict:
+    """Account, plan and per-model quota."""
+    return (await ide_rpc("GetUserStatus")).get("userStatus", {})
+
+async def ide_models() -> list[dict]:
+    """Models offered in the IDE's model picker (label, modelId, modelOrAlias, quotaInfo)."""
+    status = await ide_user_status()
+    return status.get("cascadeModelConfigData", {}).get("clientModelConfigs", [])
+
+async def ide_conversations() -> list[tuple[str, dict]]:
+    """IDE conversations, most recently used first."""
+    convs = (await ide_rpc("GetAllCascadeTrajectories")).get("trajectorySummaries", {})
+    return sorted(convs.items(), key=lambda kv: kv[1].get("lastModifiedTime", ""), reverse=True)
+
+async def refresh_latest_user_conversation():
+    """Remember which IDE chat the user last typed into (used when following the latest)."""
+    global _latest_user_conv
+    convs = await ide_conversations()
+    typed = [(info.get("lastUserInputTime", ""), cid) for cid, info in convs if info.get("lastUserInputTime")]
+    if typed:
+        _latest_user_conv = max(typed)[1]
+
+async def ide_send_message(conv_id: str, text: str, model_id: str | None = None):
+    """Post text into an IDE conversation as a user message, like typing in the chat panel."""
+    data = (await ide_user_status()).get("cascadeModelConfigData", {})
+    model = next((c["modelOrAlias"] for c in data.get("clientModelConfigs", [])
+                  if c.get("modelId") == model_id and c.get("modelOrAlias")), None)
+    model = model or data.get("defaultOverrideModelConfig", {}).get("modelOrAlias")
+    planner: dict = {"conversational": {}}
+    if model:
+        planner["requestedModel"] = model
+    await ide_rpc("SendUserCascadeMessage", {
+        "cascadeId": conv_id,
+        "items": [{"text": text}],
+        "cascadeConfig": {"plannerConfig": planner},
+    })
+
+async def ide_new_conversation() -> str:
+    """Start a new, empty IDE conversation and return its ID."""
+    res = await ide_rpc("StartCascade", {
+        "source": "CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT",
+        "trajectoryType": "CORTEX_TRAJECTORY_TYPE_CASCADE",
+    })
+    return res["cascadeId"]
+
+async def ide_stop(conv_id: str):
+    """Stop the agent's current run in a conversation (the IDE's stop button)."""
+    await ide_rpc("CancelCascadeInvocation", {"cascadeId": conv_id})
 
 def attach_to_user_desktop():
     """Ensure the current thread is attached to the interactive 'Default' desktop on Windows."""
@@ -210,15 +371,36 @@ def get_main_keyboard():
         [KeyboardButton("📊 Quota & Tokens"), KeyboardButton("🖥️ System Status")],
         [KeyboardButton("📂 Files & Projects"), KeyboardButton("🐙 Git & GitHub")],
         [KeyboardButton("📸 Screenshot"), KeyboardButton("🧠 Switch Model")],
+        [KeyboardButton("🗂️ IDE Chats"), KeyboardButton("🛑 Stop Agent")],
         [KeyboardButton("🔄 Reset Agent"), KeyboardButton("❓ Help & Commands")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-def get_model_inline_keyboard(current_model: str):
+async def get_model_inline_keyboard(current_model: str):
+    """Model picker built from the IDE's own model list, with each model's remaining quota."""
+    try:
+        models = [(m["modelId"], m.get("label", m["modelId"]), m.get("quotaInfo"))
+                  for m in await ide_models() if m.get("modelId")]
+    except IDEUnavailable:
+        models = [(m_id, desc, None) for m_id, desc in AVAILABLE_MODELS]
     buttons = []
-    for m_id, desc in AVAILABLE_MODELS:
+    for m_id, label, quota in models:
         prefix = "✅ " if m_id == current_model else ""
-        buttons.append([InlineKeyboardButton(f"{prefix}{desc}", callback_data=f"model:{m_id}")])
+        # Protobuf JSON omits zero values: quotaInfo without remainingFraction means none left
+        suffix = f" · {int(round(float(quota.get('remainingFraction', 0)) * 100))}% left" if quota is not None else ""
+        buttons.append([InlineKeyboardButton(f"{prefix}{label}{suffix}", callback_data=f"model:{m_id}")])
+    return InlineKeyboardMarkup(buttons)
+
+async def get_conversations_inline_keyboard(current_conv: str):
+    """Picker for which IDE conversation Telegram messages go to."""
+    status_icons = {"CASCADE_RUN_STATUS_RUNNING": "⏳", "CASCADE_RUN_STATUS_IDLE": "💤"}
+    buttons = []
+    for conv_id, info in (await ide_conversations())[:10]:
+        prefix = "✅ " if conv_id == current_conv else status_icons.get(info.get("status"), "💬") + " "
+        title = (info.get("summary") or "Untitled conversation")[:45]
+        buttons.append([InlineKeyboardButton(f"{prefix}{title}", callback_data=f"conv:{conv_id}")])
+    buttons.append([InlineKeyboardButton("🔄 Follow latest automatically", callback_data="conv:auto"),
+                    InlineKeyboardButton("➕ New chat", callback_data="action:reset")])
     return InlineKeyboardMarkup(buttons)
 
 def get_projects_inline_keyboard():
@@ -277,24 +459,6 @@ async def send_long_message(message, text: str, parse_mode=None, reply_markup=No
         except Exception:
             await message.reply_text(chunk, reply_markup=markup)
 
-async def fetch_quota_data():
-    if not Path(AGY_PATH).exists():
-        return None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            AGY_PATH, "-p", "/usage", "--output-format", "json",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(Path.home())
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode == 0 and stdout:
-            data = json.loads(stdout.decode("utf-8", errors="replace"))
-            return data.get("command", {}).get("data", {})
-    except Exception as e:
-        logger.error(f"Error fetching quota: {e}")
-    return None
-
 def is_git_repo(path_str: str) -> bool:
     try:
         p = Path(path_str)
@@ -343,32 +507,33 @@ def build_status_text(chat_id: int) -> str:
     )
 
 async def build_quota_text() -> str:
-    data = await fetch_quota_data()
-    if not data or not data.get("groups"):
-        try:
-            res = os.popen(f'"{AGY_PATH}" -p "/usage" --output-format text').read().strip()
-            return f"📊 **Model Quota Usage:**\n```\n{res}\n```"
-        except Exception as e:
-            return f"❌ Failed to fetch quota: {e}"
+    try:
+        status = await ide_user_status()
+    except IDEUnavailable as e:
+        return f"❌ {html.escape(str(e))}"
 
-    lines = ["📊 **Antigravity Token & Quota Status**\n━━━━━━━━━━━━━━━━━━━━"]
-    for group in data.get("groups", []):
-        gname = group.get("name", "Model Group")
-        lines.append(f"\n🏷️ **{gname}**")
-        for bucket in group.get("buckets", []):
-            bname = bucket.get("name", "Limit")
-            is_disabled = bucket.get("disabled", False)
-            if is_disabled:
-                lines.append(f"• {bname}: `Disabled / Limit Reached`")
-                continue
-            frac = bucket.get("remaining_fraction", 0.0)
-            pct = int(round(frac * 100))
-            bar = make_bar(frac, length=10)
-            reset_time = bucket.get("reset_time", "")
-            reset_str = f" (Resets: {reset_time.split('T')[0]})" if reset_time else ""
-            lines.append(f"• {bname}:\n  `[{bar}] {pct}%`{reset_str}")
+    lines = ["📊 <b>Antigravity Token & Quota Status</b>\n━━━━━━━━━━━━━━━━━━━━"]
+    plan = status.get("planStatus", {}).get("planInfo", {}).get("planName")
+    if plan:
+        lines.append(f"👤 Plan: <code>{html.escape(plan)}</code>")
+    for cfg in status.get("cascadeModelConfigData", {}).get("clientModelConfigs", []):
+        quota = cfg.get("quotaInfo")
+        if quota is None:
+            continue
+        # Protobuf JSON omits zero values: no remainingFraction means the quota is used up
+        frac = float(quota.get("remainingFraction", 0.0))
+        reset_time = quota.get("resetTime", "")
+        reset_str = ""
+        if reset_time:
+            try:
+                reset_local = datetime.fromisoformat(reset_time.replace("Z", "+00:00")).astimezone()
+                reset_str = f" (resets {reset_local.strftime('%a %d %b %H:%M')})"
+            except ValueError:
+                reset_str = f" (resets {reset_time})"
+        lbl = html.escape(cfg.get('label', 'Model'))
+        lines.append(f"• {lbl}:\n  <code>[{make_bar(frac, length=10)}] {int(round(frac * 100))}%</code>{html.escape(reset_str)}")
 
-    lines.append("\n━━━━━━━━━━━━━━━━━━━━\n💡 _Tip: Shorter tasks and flash models preserve tokens._")
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━\n⚡ <i>Connected to active Antigravity IDE session.</i>")
     return "\n".join(lines)
 
 # ==========================================
@@ -643,7 +808,13 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔄 Refresh Quota", callback_data="action:quota"),
          InlineKeyboardButton("🧠 Change Model", callback_data="action:models")]
     ])
-    await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=inline_kb)
+    try:
+        await status_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=inline_kb)
+    except Exception:
+        try:
+            await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=inline_kb)
+        except Exception:
+            await status_msg.edit_text(text, reply_markup=inline_kb)
 
 # Projects & Folder Navigation
 async def projects_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -768,25 +939,38 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.args:
         choice = context.args[0].strip()
-        valid_ids = [m[0] for m in AVAILABLE_MODELS]
+        try:
+            valid_ids = [m.get("modelId") for m in await ide_models()]
+        except IDEUnavailable:
+            valid_ids = [m[0] for m in AVAILABLE_MODELS]
         if choice in valid_ids:
             state["model"] = choice
             save_state()
             await update.message.reply_text(f"✅ Model switched to: `{choice}`", parse_mode=ParseMode.MARKDOWN)
             return
 
-    msg = f"🧠 **AI Model Selection**\nCurrently active: `{state['model']}`\nTap a button to switch:"
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_model_inline_keyboard(state["model"]))
+    msg = (f"🧠 **AI Model Selection** (from Antigravity IDE)\nCurrently active: `{state['model']}`\n"
+           f"Used for your next Telegram messages. Tap to switch:")
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=await get_model_inline_keyboard(state["model"]))
 
 async def new_conv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update):
         return
-    chat_id = update.effective_chat.id
+    await update.message.reply_text(await start_new_ide_chat(update.effective_chat.id), parse_mode=ParseMode.HTML)
+
+async def start_new_ide_chat(chat_id: int) -> str:
+    """Open a fresh IDE conversation and point this Telegram chat at it. Returns the reply text."""
+    try:
+        conv_id = await ide_new_conversation()
+    except IDEUnavailable as e:
+        return f"❌ {html.escape(str(e))}"
     state = get_state(chat_id)
-    state["conversation_id"] = None
+    state["conversation_id"] = conv_id
     state["history_count"] = 0
     save_state()
-    await update.message.reply_text("🔄 **Agent Context Cleared.** The next message will start a fresh task.", parse_mode=ParseMode.MARKDOWN)
+    return (f"🆕 <b>New Antigravity IDE chat started</b>\n"
+            f"Session: <code>{conv_id[:8]}...</code>\n"
+            f"Your next message starts it. Use /conv to switch back to another chat.")
 
 # File Upload / Download
 async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -900,7 +1084,6 @@ async def run_agent(update: Update, prompt: str):
 
     chat_id = update.effective_chat.id
     conv_id = get_active_conversation_id(chat_id)
-    agentapi = Path(AGENTAPI_PATH)
 
     # 1. Safely send acknowledgement on Telegram
     esc_prompt = html.escape(prompt[:140])
@@ -923,73 +1106,50 @@ async def run_agent(update: Update, prompt: str):
         except Exception:
             pass
 
-    # 2. Forward prompt to Antigravity IDE via agentapi
-    if not agentapi.exists():
+    async def report_failure(text: str):
+        logger.error(text)
         if status_msg:
             try:
-                await status_msg.edit_text(f"❌ Antigravity agentapi tool not found at: {agentapi}")
+                await status_msg.edit_text(text)
             except Exception:
                 pass
-        return
 
+    # 2. Post the prompt into the IDE chat as a user message, with the model chosen in Telegram
+    ide_prompt = (f"{prompt}\n\n[From Telegram. Your final reply is relayed to Telegram automatically; "
+                  f"don't send it yourself with notify_telegram.py.]")
     try:
-        proc = await asyncio.create_subprocess_exec(
-            str(agentapi),
-            "send-message",
-            f"--title=Telegram: {prompt[:30]}",
-            conv_id,
-            prompt,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        active_subprocesses[chat_id] = proc
-        stdout, stderr = await proc.communicate()
-        if proc.returncode == 0:
-            logger.info(f"Forwarded Telegram prompt to Antigravity IDE ({conv_id})")
-        else:
-            err = stderr.decode("utf-8", errors="replace").strip()
-            logger.warning(f"agentapi note: {err}")
-            if status_msg:
-                try:
-                    await status_msg.edit_text(f"⚠️ Note from IDE dispatcher:\n{err[:150]}")
-                except Exception:
-                    pass
+        await ide_send_message(conv_id, ide_prompt, get_state(chat_id).get("model"))
+        logger.info(f"Sent Telegram prompt to Antigravity IDE ({conv_id})")
+    except IDEUnavailable as e:
+        await report_failure(f"❌ {e}")
     except Exception as e:
-        logger.error(f"Dispatch failed: {e}")
-        if status_msg:
-            try:
-                await status_msg.edit_text(f"❌ Could not forward to Antigravity IDE: {e}")
-            except Exception:
-                pass
-    finally:
-        active_subprocesses.pop(chat_id, None)
+        await report_failure(f"❌ Could not send to Antigravity IDE: {e}")
 
 async def conv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pick which Antigravity IDE chat Telegram messages go to."""
     if not await check_auth(update):
         return
     chat_id = update.effective_chat.id
     state = get_state(chat_id)
     if context.args:
         arg = context.args[0].strip()
-        if arg.lower() in ("auto", "latest"):
-            state["conversation_id"] = None
-            save_state()
-            active = get_active_conversation_id(chat_id)
-            await update.message.reply_text(f"🔄 Switched to **auto-tracking** latest conversation.\nActive: `{active}`", parse_mode=ParseMode.MARKDOWN)
-        else:
-            state["conversation_id"] = arg
-            save_state()
-            await update.message.reply_text(f"🎯 Target conversation locked to:\n`{arg}`", parse_mode=ParseMode.MARKDOWN)
-        return
+        state["conversation_id"] = "auto" if arg.lower() in ("auto", "latest") else arg
+        save_state()
     active = get_active_conversation_id(chat_id)
+    try:
+        keyboard = await get_conversations_inline_keyboard(active)
+    except IDEUnavailable as e:
+        await update.message.reply_text(f"❌ {html.escape(str(e))}")
+        return
     await update.message.reply_text(
-        f"🆔 **Antigravity IDE Conversation**\n"
-        f"Active ID: `{active}`\n\n"
-        f"Use `/conv <id>` to change or `/conv auto` to always track the latest IDE session.",
-        parse_mode=ParseMode.MARKDOWN
+        f"🗂️ <b>Antigravity IDE chats</b>\nActive: <code>{active[:8]}...</code>\n"
+        f"Tap a chat to send your Telegram messages there:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
     )
 
 async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop a running /run shell command, or else the IDE agent's current run."""
     if not await check_auth(update):
         return
     chat_id = update.effective_chat.id
@@ -997,11 +1157,17 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if proc:
         try:
             proc.terminate()
-            await update.message.reply_text("🛑 Active task terminated.")
+            await update.message.reply_text("🛑 Shell command terminated.")
         except Exception as e:
             await update.message.reply_text(f"Error terminating process: {e}")
-    else:
-        await update.message.reply_text("ℹ️ No active agent or task is running for your chat.")
+        return
+    conv_id = get_active_conversation_id(chat_id)
+    try:
+        await ide_stop(conv_id)
+        await update.message.reply_text(f"🛑 Stopped the IDE agent in chat <code>{conv_id[:8]}...</code>",
+                                        parse_mode=ParseMode.HTML)
+    except IDEUnavailable as e:
+        await update.message.reply_text(f"❌ {html.escape(str(e))}")
 
 # ==========================================
 # BUTTON & CALLBACK ROUTING
@@ -1027,7 +1193,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"✅ **Active Model switched to:** `{model_id}`\nTap below to change again:",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_model_inline_keyboard(model_id)
+            reply_markup=await get_model_inline_keyboard(model_id)
         )
 
     elif data.startswith("proj:"):
@@ -1109,21 +1275,39 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("🔄 Refresh Quota", callback_data="action:quota"),
              InlineKeyboardButton("🧠 Change Model", callback_data="action:models")]
         ])
-        await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=inline_kb)
+        try:
+            await status_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=inline_kb)
+        except Exception:
+            try:
+                await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=inline_kb)
+            except Exception:
+                await status_msg.edit_text(text, reply_markup=inline_kb)
 
     elif data == "action:models":
         msg = f"🧠 **AI Model Selection**\nCurrently active: `{state['model']}`\nTap a button to switch:"
-        await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_model_inline_keyboard(state["model"]))
+        await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=await get_model_inline_keyboard(state["model"]))
 
     elif data == "action:projects":
         msg = f"📑 **Project & Folder Manager**\nCurrent Folder: `{state['cwd']}`\nTap to switch:"
         await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_projects_inline_keyboard())
 
     elif data == "action:reset":
-        state["conversation_id"] = None
-        state["history_count"] = 0
+        await query.message.reply_text(await start_new_ide_chat(chat_id), parse_mode=ParseMode.HTML)
+
+    elif data.startswith("conv:"):
+        choice = data.split(":", 1)[1]
+        state["conversation_id"] = choice
         save_state()
-        await query.message.reply_text("🔄 **Agent Context Reset.** Next instruction starts fresh.", parse_mode=ParseMode.MARKDOWN)
+        active = get_active_conversation_id(chat_id)
+        mode = "Following the latest IDE chat" if choice == "auto" else "Telegram messages now go to this IDE chat"
+        try:
+            await query.edit_message_text(
+                f"🗂️ <b>{mode}</b>\nActive: <code>{active[:8]}...</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=await get_conversations_inline_keyboard(active),
+            )
+        except IDEUnavailable as e:
+            await query.message.reply_text(f"❌ {html.escape(str(e))}")
 
     # Git Callbacks
     elif data == "git:status":
@@ -1184,6 +1368,10 @@ async def handle_bottom_button_press(update: Update, context: ContextTypes.DEFAU
         await git_command_menu(update, context)
     elif text == "🧠 Switch Model":
         await model_command(update, context)
+    elif text == "🗂️ IDE Chats":
+        await conv_command(update, context)
+    elif text == "🛑 Stop Agent":
+        await kill_command(update, context)
     elif text == "🔄 Reset Agent":
         await new_conv_command(update, context)
     elif text == "❓ Help & Commands":
@@ -1259,49 +1447,59 @@ async def handle_voice_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def transcript_monitor(application: Application):
     """Background monitor: streams completed agent responses from transcript.jsonl back to Telegram."""
     logger.info("Starting live transcript monitor for Antigravity IDE responses...")
-    last_step_index = -1
-    conv_id = get_active_conversation_id()
-    transcript_path = (Path.home() / ".gemini" / "antigravity-ide" / "brain" / conv_id /
-                       ".system_generated" / "logs" / "transcript.jsonl")
-    if transcript_path.exists():
-        try:
-            for line in transcript_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                if line.strip():
-                    try:
-                        data = json.loads(line)
-                        idx = data.get("step_index", -1)
-                        if idx > last_step_index:
-                            last_step_index = idx
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+    # Step indexes are per conversation; the active conversation can change while running.
+    last_step_index: dict[str, int] = {}
+    agent_notified: dict[str, bool] = {}
+    last_ide_refresh = 0.0
 
-    logger.info(f"Transcript monitor active from step_index={last_step_index}")
+    def read_steps(path: Path) -> list[dict]:
+        steps = []
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.strip():
+                try:
+                    steps.append(json.loads(line))
+                except Exception:
+                    pass
+        return steps
 
     while True:
         try:
             await asyncio.sleep(1.5)
-            conv_id = get_active_conversation_id()
+            if time.monotonic() - last_ide_refresh > 10:
+                last_ide_refresh = time.monotonic()
+                try:
+                    await refresh_latest_user_conversation()
+                except IDEUnavailable:
+                    pass
+            # Follow the chat picked from Telegram (/conv), like run_agent does
+            primary_chat = int(os.getenv("TELEGRAM_CHAT_ID", "0") or 0) or None
+            conv_id = get_active_conversation_id(primary_chat)
             transcript_path = (Path.home() / ".gemini" / "antigravity-ide" / "brain" / conv_id /
                                ".system_generated" / "logs" / "transcript.jsonl")
             if not transcript_path.exists():
                 continue
 
-            lines = transcript_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-            for line in lines:
-                if not line.strip():
-                    continue
-                try:
-                    data = json.loads(line)
-                except Exception:
-                    continue
+            steps = read_steps(transcript_path)
+            if conv_id not in last_step_index:
+                # First time seeing this conversation: skip its history, only stream new responses
+                last_step_index[conv_id] = max((s.get("step_index", -1) for s in steps), default=-1)
+                logger.info(f"Transcript monitor tracking {conv_id[:8]} from step_index={last_step_index[conv_id]}")
+                continue
 
+            for data in steps:
                 idx = data.get("step_index", -1)
-                if idx <= last_step_index:
+                if idx <= last_step_index[conv_id]:
                     continue
 
-                last_step_index = idx
+                last_step_index[conv_id] = idx
+
+                # The agent sometimes messages Telegram itself via notify_telegram.py.
+                # Remember that per turn so its final response isn't relayed a second time.
+                if data.get("type") == "USER_INPUT" or (
+                        data.get("type") == "SYSTEM_MESSAGE" and "[Message]" in str(data.get("content", ""))):
+                    agent_notified[conv_id] = False
+                if "notify_telegram" in json.dumps(data.get("tool_calls") or []):
+                    agent_notified[conv_id] = True
 
                 # Final agent response turn to user
                 if (data.get("source") == "MODEL" and
@@ -1311,6 +1509,9 @@ async def transcript_monitor(application: Application):
 
                     content = data["content"].strip()
                     if not content:
+                        continue
+                    if agent_notified.pop(conv_id, False):
+                        logger.info(f"Skipping relay of step {idx}: agent already messaged Telegram this turn")
                         continue
 
                     target_chats = [cid for cid in whitelisted_ids if cid != 12345678]
@@ -1364,6 +1565,8 @@ def main():
     application.add_handler(CommandHandler("run", run_shell_command))
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("conv", conv_command))
+    application.add_handler(CommandHandler("chats", conv_command))
+    application.add_handler(CommandHandler("stop", kill_command))
 
     # Git Commands
     application.add_handler(CommandHandler("git", raw_git_command))

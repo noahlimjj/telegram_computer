@@ -17,7 +17,7 @@ except Exception as e:
     sys.exit(1)
 
 print("\n--- [TEST 2] Testing Configuration & Auth ---")
-from bot import ALLOWED_USERNAME, BOT_TOKEN, AGY_PATH, is_authorized, get_state, save_state
+from bot import ALLOWED_USERNAME, BOT_TOKEN, is_authorized, get_state, save_state
 
 class DummyUser:
     def __init__(self, id, username):
@@ -52,18 +52,20 @@ assert "cwd" in state, "State must have cwd"
 assert Path(state["cwd"]).exists(), f"CWD {state['cwd']} must exist"
 print(f"✅ State verified. Active CWD: {state['cwd']}, Model: {state['model']}")
 
-print("\n--- [TEST 6] Testing Antigravity CLI Binary Path ---")
-if Path(AGY_PATH).exists():
-    print(f"✅ Antigravity binary found at: {AGY_PATH}")
-else:
-    print(f"⚠️ Antigravity binary not found at {AGY_PATH}")
+print("\n--- [TEST 6] Testing Antigravity IDE Connection ---")
+import asyncio
+from bot import get_ls_env, ide_conversations
+ls = asyncio.run(get_ls_env())
+assert ls, "Antigravity IDE language server not found. Is the IDE open?"
+convs = asyncio.run(ide_conversations())
+print(f"✅ Connected to IDE at {ls['address']}, {len(convs)} conversation(s) found.")
 
 print("\n--- [TEST 7] Testing Quota Fetching ---")
-import asyncio
 from bot import build_quota_text
 quota_text = asyncio.run(build_quota_text())
 print("Quota Output Sample:")
 print(quota_text[:300] + "...")
+assert "Quota Status" in quota_text, "Quota should come from the IDE"
 print("✅ Quota fetched successfully.")
 
 print("\n===============================")
