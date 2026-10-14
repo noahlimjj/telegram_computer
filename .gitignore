@@ -1,0 +1,31 @@
+# Secrets and credentials (NEVER commit!)
+.env
+*.env
+.env.*
+!.env.example
+
+# User session and whitelist state
+user_state.json
+whitelist.json
+
+# Logs
+*.log
+*.log.*
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary audio and images
+*.ogg
+*.mp3
+*.wav
+*.png
+*.jpg
+*.jpeg
+temp_*
+voice_*
+
+# Backups
+*.bak
