@@ -17,7 +17,13 @@ except Exception as e:
     sys.exit(1)
 
 print("\n--- [TEST 2] Testing Configuration & Auth ---")
+import bot
 from bot import ALLOWED_USERNAME, BOT_TOKEN, is_authorized, get_state, save_state
+
+# is_authorized() whitelists matching users and saves whitelist.json. The dummy IDs below
+# are real Telegram account IDs, so never let the test persist them.
+bot.save_whitelist = lambda: None
+_real_whitelist = set(bot.whitelisted_ids)
 
 class DummyUser:
     def __init__(self, id, username):
@@ -29,6 +35,8 @@ user_hacker = DummyUser(99999999, "unknown_stranger")
 
 assert is_authorized(user_noah) == True, "Noah should be authorized"
 assert is_authorized(user_hacker) == False, "Stranger should be rejected"
+bot.whitelisted_ids.clear()
+bot.whitelisted_ids.update(_real_whitelist)
 print(f"✅ Auth check passed. @{ALLOWED_USERNAME} is authorized, strangers are blocked.")
 
 print("\n--- [TEST 3] Testing Hardware & Status Reporting ---")
